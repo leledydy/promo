@@ -1,0 +1,17 @@
+{
+  "name": "kripto11-promo-bot",
+  "version": "1.0.0",
+  "description": "Discord bot to post Kripto11 Free Airdrop Cashback promo with claim tracking",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "deploy": "node deploy-commands.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "sqlite3": "^5.1.7",
+    "node-cron": "^3.0.3"
+  }
+}
