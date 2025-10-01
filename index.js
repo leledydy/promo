@@ -53,9 +53,10 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`Logged in as ${client.user.tag} ✅`);
 });
+
 
 // === Helpers ===
 function buildPromoEmbed({ title, subtitle, minGames, depositRequired, bannerURL }) {
