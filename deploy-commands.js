@@ -1,45 +1,26 @@
 import 'dotenv/config';
 import { REST, Routes, SlashCommandBuilder } from 'discord.js';
 
+if (!process.env.DISCORD_TOKEN) throw new Error('Missing DISCORD_TOKEN');
+if (!process.env.CLIENT_ID) throw new Error('Missing CLIENT_ID');
+if (!process.env.GUILD_ID) throw new Error('Missing GUILD_ID (for instant guild deploy)');
+
 const commands = [
-  new SlashCommandBuilder()
-    .setName('promo')
-    .setDescription('Post the Free Airdrop Cashback promo embed')
-    .addStringOption(o => o.setName('title').setDescription('Custom title').setRequired(false))
-    .addStringOption(o => o.setName('subtitle').setDescription('Custom subtitle/line').setRequired(false))
-    .addIntegerOption(o => o.setName('min_games').setDescription('Minimum games required').setRequired(false))
-    .addBooleanOption(o => o.setName('deposit_required').setDescription('Require first deposit?').setRequired(false))
-    .addChannelOption(o => o.setName('channel').setDescription('Channel to post into').setRequired(false))
-    .addStringOption(o => o.setName('banner_url').setDescription('Banner image URL (overrides local file)').setRequired(false))
-    .addBooleanOption(o => o.setName('ping_everyone').setDescription('Tag @everyone').setRequired(false))
-    .toJSON(),
-  new SlashCommandBuilder()
-    .setName('claims')
-    .setDescription('Admin: list pending cashback claims'),
-  new SlashCommandBuilder()
-    .setName('approve')
-    .setDescription('Admin: approve a claim by user ID')
-    .addStringOption(o => o.setName('user_id').setDescription('Discord user ID').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('reject')
-    .setDescription('Admin: reject a claim by user ID')
-    .addStringOption(o => o.setName('user_id').setDescription('Discord user ID').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('autopromo')
-    .setDescription('Admin: toggle daily auto-post (09:00 server time)')
-    .addBooleanOption(o => o.setName('enable').setDescription('Enable or disable').setRequired(true))
-].map(c => c);
+  new SlashCommandBuilder().setName('ping').setDescription('Simple ping test'),
+  new SlashCommandBuilder().setName('promo').setDescription('Post the Free Airdrop Cashback promo'),
+].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
-async function main() {
-  const { CLIENT_ID, GUILD_ID } = process.env;
-  if (GUILD_ID) {
-    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-    console.log('Registered GUILD commands ✅');
-  } else {
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-    console.log('Registered GLOBAL commands (may take up to 1h) ✅');
+(async () => {
+  try {
+    console.log('Deploying guild commands to', process.env.GUILD_ID);
+    const result = await rest.put(
+      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+      { body: commands }
+    );
+    console.log('✅ Registered GUILD commands:', result.map(c => `${c.name}:${c.id}`).join(', '));
+  } catch (err) {
+    console.error('❌ Deploy failed:', err?.data ?? err);
   }
-}
-main().catch(console.error);
+})();
