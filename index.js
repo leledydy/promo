@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import './server.js'; // safe to include; needed only if Railway uses Web service
 import cron from 'node-cron';
 import {
   Client,
@@ -7,49 +8,51 @@ import {
   ChannelType
 } from 'discord.js';
 
-/* =======================
-   ENV & SANITY CHECKS
-======================= */
+/* ===== ENV / CONFIG ===== */
 const token = (process.env.DISCORD_TOKEN || '').trim();
 const channelId = (process.env.CHANNEL_ID || '').trim();
-const cronExpr = (process.env.POST_CRON || '0 9 * * *').trim();
+
+// Schedule settings
+const cronExpr = (process.env.POST_CRON || '0 9 * * *').trim(); // default: 09:00 daily
 const tz = (process.env.TZ || 'UTC').trim();
+
+// Message options
 const pingEveryone = String(process.env.PING_EVERYONE || 'false').toLowerCase() === 'true';
 const bannerUrl = (process.env.BANNER_URL || '').trim();
 const footerText = (process.env.FOOTER_TEXT || 'Kripto11 • Play Smart. Earn Fast.').trim();
 const brandColor = parseInt((process.env.BRAND_COLOR || 'FFD700').replace('#', ''), 16);
 const minGames = Number(process.env.MIN_GAMES || 10);
+const sendOnBoot = String(process.env.SEND_ON_BOOT || 'false').toLowerCase() === 'true';
 
-// Basic token format guard (helps catch the TokenInvalid issue early)
+/* ===== Sanity Guards (catch common mistakes fast) ===== */
 if (!token) {
-  console.error('❌ Missing DISCORD_TOKEN in .env');
+  console.error('❌ Missing DISCORD_TOKEN in env.');
   process.exit(1);
 }
 if ((token.match(/\./g) || []).length !== 2) {
-  console.error('❌ DISCORD_TOKEN format looks wrong (should contain 2 dots). Make sure you pasted the *Bot Token*, not Client ID/Secret, and no quotes.');
+  console.error('❌ DISCORD_TOKEN format looks wrong (should contain 2 dots). Paste the *Bot Token* exactly, no quotes, no "Bot " prefix.');
   process.exit(1);
 }
 if (!channelId) {
-  console.error('❌ Missing CHANNEL_ID in .env');
+  console.error('❌ Missing CHANNEL_ID in env.');
   process.exit(1);
 }
 
-/* =======================
-   CLIENT
-======================= */
+/* ===== Discord Client ===== */
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  // Confirm guilds
   const guilds = [...client.guilds.cache.values()].map(g => `${g.name} (${g.id})`);
   console.log('• In guilds:', guilds.join(' | ') || 'none');
-  console.log(`• Will post daily using cron "${cronExpr}" with TZ="${tz}" to channel ${channelId}`);
+  console.log(`• Cron "${cronExpr}" TZ="${tz}" → channel ${channelId}`);
+
+  if (sendOnBoot) {
+    console.log('▶ SEND_ON_BOOT=true → sending promo now…');
+    await sendPromo();
+  }
 });
 
-/* =======================
-   PROMO MESSAGE
-======================= */
 function buildPromoEmbed() {
   return new EmbedBuilder()
     .setColor(brandColor)
@@ -58,8 +61,8 @@ function buildPromoEmbed() {
       [
         '💸 **Exclusive Welcome Promo for New Members!** 💸',
         '',
-        `🔥 Register today, make your **first deposit**, and enjoy:`,
-        `✅ **FREE Airdrop Cashback** credited to your wallet`,
+        '🔥 Register today, make your **first deposit**, and enjoy:',
+        '✅ **FREE Airdrop Cashback** credited to your wallet',
         `✅ Available after you’ve played a minimum of **${minGames} games**`,
         '',
         '⚡ **How it works:**',
@@ -82,10 +85,8 @@ async function sendPromo() {
       console.error('❌ CHANNEL_ID is not a text channel or not accessible.');
       return;
     }
-
     const embed = buildPromoEmbed();
     const content = pingEveryone ? '@everyone' : undefined;
-
     await channel.send({ content, embeds: [embed] });
     console.log('✅ Promo sent.');
   } catch (err) {
@@ -93,21 +94,18 @@ async function sendPromo() {
   }
 }
 
-/* =======================
-   CRON SCHEDULER
-======================= */
+/* ===== Cron Scheduler ===== */
 cron.schedule(cronExpr, () => {
   console.log('⏰ Cron triggered → sending promo…');
   sendPromo();
 }, { timezone: tz });
 
-/* =======================
-   START
-======================= */
+/* ===== Start ===== */
 client.login(token).catch(err => {
   console.error('❌ Login failed:', err?.message || err);
   process.exit(1);
 });
 
-// Optional: send once on boot (comment out if you only want scheduled posts)
-// sendPromo();
+// Optional graceful shutdown logs
+process.on('SIGTERM', () => { console.log('🛑 SIGTERM received'); process.exit(0); });
+process.on('SIGINT',  () => { console.log('🛑 SIGINT received');  process.exit(0); });
