@@ -30,7 +30,7 @@ const {
 } = process.env;
 
 if (!DISCORD_TOKEN || !FORUM_CHANNEL_ID || !SUPPORT_CHANNEL_ID || !ADMIN_USER_ID) {
-  console.error('❌ Missing required environment variables. Need DISCORD_TOKEN, FORUM_CHANNEL_ID, SUPPORT_CHANNEL_ID, ADMIN_USER_ID');
+  console.error('❌ Missing required env vars: DISCORD_TOKEN, FORUM_CHANNEL_ID, SUPPORT_CHANNEL_ID, ADMIN_USER_ID');
   process.exit(1);
 }
 
@@ -38,7 +38,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.DirectMessages
+    GatewayIntentBits.DirectMessages // required to DM admin
   ],
   partials: [Partials.Channel, Partials.Message] // Channel for DMs; Message for delete watcher
 });
@@ -140,10 +140,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton()) {
       // Report Problem -> show modal
       if (interaction.customId === 'btn_report_problem') {
-        const modal = new ModalBuilder()
-          .setCustomId('modal_report_problem')
-          .setTitle('Report Server Problem');
-
         const titleInput = new TextInputBuilder()
           .setCustomId('rp_title')
           .setLabel('Short Title')
@@ -160,13 +156,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setMaxLength(1500)
           .setPlaceholder('What happened? When? Any error codes? Steps to reproduce?');
 
-        const row1 = new ActionRowBuilder().addComponents(titleInput);
-        const row2 = new ActionRowBuilder().addComponents(detailInput);
-
         const reportModal = new ModalBuilder()
           .setCustomId('modal_report_problem')
           .setTitle('Report Server Problem')
-          .addComponents(row1, row2);
+          .addComponents(
+            new ActionRowBuilder().addComponents(titleInput),
+            new ActionRowBuilder().addComponents(detailInput)
+          );
 
         await interaction.showModal(reportModal);
         return;
@@ -174,10 +170,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       // Talk to Staff/Admin -> show modal (later DMs admin)
       if (interaction.customId === 'btn_talk_staff') {
-        const modal = new ModalBuilder()
-          .setCustomId('modal_talk_staff')
-          .setTitle('Message Admin / Staff');
-
         const msgInput = new TextInputBuilder()
           .setCustomId('ts_message')
           .setLabel('Your message')
@@ -186,12 +178,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setMaxLength(1500)
           .setPlaceholder('Write what you want to tell the admin');
 
-        const row = new ActionRowBuilder().addComponents(msgInput);
-
         const talkModal = new ModalBuilder()
           .setCustomId('modal_talk_staff')
           .setTitle('Message Admin / Staff')
-          .addComponents(row);
+          .addComponents(new ActionRowBuilder().addComponents(msgInput));
 
         await interaction.showModal(talkModal);
         return;
@@ -225,12 +215,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // DM Admin directly from talk-to-staff modal
+      // DM Admin directly from talk-to-staff modal (robust + guaranteed confirmation)
       if (interaction.customId === 'modal_talk_staff') {
         await interaction.deferReply({ ephemeral: true });
 
         const message = interaction.fields.getTextInputValue('ts_message').trim();
-        const adminUser = await client.users.fetch(ADMIN_USER_ID);
+
+        // Fetch admin and create a DM channel explicitly
+        let adminUser;
+        try {
+          adminUser = await client.users.fetch(ADMIN_USER_ID, { force: true });
+        } catch (e) {
+          console.error('Failed to fetch ADMIN_USER_ID:', e);
+          try {
+            await interaction.editReply({ content: '❌ Could not find the Admin account. Check ADMIN_USER_ID.' });
+          } catch {}
+          return;
+        }
 
         const dmEmbed = new EmbedBuilder()
           .setTitle('📩 New Message for Admin')
@@ -242,15 +243,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setTimestamp()
           .setColor(0x5865f2);
 
-        let dmFailed = false;
-        await adminUser.send({ embeds: [dmEmbed] }).catch(() => { dmFailed = true; });
-
-        if (dmFailed) {
-          await interaction.editReply({ content: '⚠️ Could not DM the Admin (their DMs might be closed).' });
-          return;
+        let sentOK = true;
+        try {
+          const dm = await adminUser.createDM();
+          await dm.send({ embeds: [dmEmbed] });
+        } catch (e) {
+          sentOK = false;
+          console.error('Admin DM failed:', e);
         }
 
-        await interaction.editReply({ content: '✅ Your message was sent directly to the Admin.' });
+        const replyMsg = sentOK
+          ? '✅ Your message was sent directly to the Admin.'
+          : '⚠️ I could not DM the Admin (their DMs might be closed or the ID is wrong).';
+        try {
+          await interaction.editReply({ content: replyMsg });
+        } catch {
+          try { await interaction.followUp({ content: replyMsg, ephemeral: true }); } catch {}
+        }
         return;
       }
     }
