@@ -10,22 +10,14 @@ import {
   GatewayIntentBits,
   ModalBuilder,
   Partials,
-  SlashCommandBuilder,
-  StringSelectMenuBuilder,
-  StringSelectMenuOptionBuilder,
-  StringSelectMenuInteraction,
-  StringSelectMenuComponent,
-  StringSelectMenuOptionComponent,
-  StringSelectMenuBuilder as SelectMenuBuilder,
   TextInputBuilder,
   TextInputStyle
 } from 'discord.js';
 
-const {
-  DISCORD_TOKEN,
-  FORUM_CHANNEL_ID,
-  ADMIN_USER_ID
-} = process.env;
+// Optional: simple health server so Railway shows service as “up”
+import './server.js';
+
+const { DISCORD_TOKEN, FORUM_CHANNEL_ID, ADMIN_USER_ID } = process.env;
 
 if (!DISCORD_TOKEN || !FORUM_CHANNEL_ID || !ADMIN_USER_ID) {
   console.error('Missing env vars: DISCORD_TOKEN / FORUM_CHANNEL_ID / ADMIN_USER_ID');
@@ -38,10 +30,9 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.DirectMessages
   ],
-  partials: [Partials.Channel] // required for DMs
+  partials: [Partials.Channel]
 });
 
-// Utility: safe fetch of forum channel
 async function getForumChannel(guild) {
   const ch = await guild.channels.fetch(FORUM_CHANNEL_ID).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildForum) {
@@ -50,19 +41,19 @@ async function getForumChannel(guild) {
   return ch;
 }
 
-// Build the ticket panel components
-function buildPanelComponents() {
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('btn_report_problem')
-      .setLabel('Report Server Problem')
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId('btn_talk_staff')
-      .setLabel('Talk to Staff/Admin')
-      .setStyle(ButtonStyle.Primary)
-  );
-  return [row];
+function panelComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('btn_report_problem')
+        .setLabel('Report Server Problem')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('btn_talk_staff')
+        .setLabel('Talk to Staff/Admin')
+        .setStyle(ButtonStyle.Primary)
+    )
+  ];
 }
 
 client.once(Events.ClientReady, (c) => {
@@ -71,27 +62,20 @@ client.once(Events.ClientReady, (c) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // Handle /ticket-panel
-    if (interaction.isChatInputCommand()) {
-      if (interaction.commandName === 'ticket-panel') {
-        const embed = new EmbedBuilder()
-          .setTitle('🎫 Support & Reports')
-          .setDescription([
-            'Use the buttons below:',
-            '• **Report Server Problem** → create a post in our **Forum** for tracking.',
-            '• **Talk to Staff/Admin** → send a private message to an Admin.'
-          ].join('\n'))
-          .setColor(0x2b2d31);
+    if (interaction.isChatInputCommand() && interaction.commandName === 'ticket-panel') {
+      const embed = new EmbedBuilder()
+        .setTitle('🎫 Support & Reports')
+        .setDescription([
+          'Use the buttons below:',
+          '• **Report Server Problem** → creates a **Forum post** for tracking.',
+          '• **Talk to Staff/Admin** → sends a **private message** to an Admin.'
+        ].join('\n'))
+        .setColor(0x2b2d31);
 
-        await interaction.reply({
-          embeds: [embed],
-          components: buildPanelComponents()
-        });
-      }
+      await interaction.reply({ embeds: [embed], components: panelComponents() });
       return;
     }
 
-    // Handle buttons
     if (interaction.isButton()) {
       if (interaction.customId === 'btn_report_problem') {
         const modal = new ModalBuilder()
@@ -114,11 +98,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setMaxLength(1500)
           .setPlaceholder('What happened? When? Any error codes? Steps to reproduce?');
 
-        const row1 = new ActionRowBuilder().addComponents(titleInput);
-        const row2 = new ActionRowBuilder().addComponents(detailInput);
-        modal.addComponents(row1, row2);
-
-        await interaction.showModal(modal);
+        await interaction.showModal(modal.addComponents(
+          new ActionRowBuilder().addComponents(titleInput),
+          new ActionRowBuilder().addComponents(detailInput)
+        ));
         return;
       }
 
@@ -135,80 +118,66 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setMaxLength(1500)
           .setPlaceholder('How can we help?');
 
-        const row = new ActionRowBuilder().addComponents(msgInput);
-        modal.addComponents(row);
-
-        await interaction.showModal(modal);
+        await interaction.showModal(modal.addComponents(
+          new ActionRowBuilder().addComponents(msgInput)
+        ));
         return;
       }
     }
 
-    // Handle modals
     if (interaction.isModalSubmit()) {
-      // 1) Report → create forum thread + starter message
       if (interaction.customId === 'modal_report_problem') {
         await interaction.deferReply({ ephemeral: true });
 
         const title = interaction.fields.getTextInputValue('rp_title').trim();
         const details = interaction.fields.getTextInputValue('rp_details').trim();
-
         const forum = await getForumChannel(interaction.guild);
 
-        // Create a new forum post with starter message
         const thread = await forum.threads.create({
           name: `${title} — by ${interaction.user.tag}`,
           message: {
-            content:
-              [
-                `**Reporter:** ${interaction.user} (${interaction.user.tag})`,
-                `**Title:** ${title}`,
-                `**Details:**\n${details}`
-              ].join('\n')
+            content: [
+              `**Reporter:** ${interaction.user} (${interaction.user.tag})`,
+              `**Title:** ${title}`,
+              `**Details:**\n${details}`
+            ].join('\n')
           },
-          appliedTags: [] // add Tag IDs here if you use forum tags
+          appliedTags: []
         });
 
         await interaction.editReply({
-          content: `✅ Your report has been posted: ${thread?.toString() || thread?.url || 'created thread'}. Our team will follow up there.`
+          content: `✅ Your report has been posted: ${thread?.toString() || thread?.url || 'created thread'}.`
         });
         return;
       }
 
-      // 2) Talk to Staff → DM Admin with user message
       if (interaction.customId === 'modal_talk_staff') {
         await interaction.deferReply({ ephemeral: true });
 
         const message = interaction.fields.getTextInputValue('ts_message').trim();
-
-        // Fetch admin user & DM them
         const adminUser = await client.users.fetch(ADMIN_USER_ID);
+
         const dmEmbed = new EmbedBuilder()
-          .setTitle('👤 New DM to Admin from a user')
+          .setTitle('👤 New message to Admin')
           .addFields(
-            { name: 'From', value: `${interaction.user} (${interaction.user.tag})`, inline: false },
-            { name: 'Message', value: message || '(no content)', inline: false }
+            { name: 'From', value: `${interaction.user} (${interaction.user.tag})` },
+            { name: 'Message', value: message || '(no content)' }
           )
           .setTimestamp();
 
         await adminUser.send({ embeds: [dmEmbed] }).catch(async () => {
-          // If admin DMs are closed, fall back to telling the user
           await interaction.editReply({
-            content: '⚠️ I could not DM the admin (their DMs might be closed). Please ping an online staff member.'
+            content: '⚠️ Could not DM the admin (DMs might be closed). Please ping a staff member.'
           });
           return;
         });
 
-        // Confirm to the user (and open bot→user DM thread so they can reply)
         try {
-          await interaction.user.send(
-            [
-              '📨 Your message has been forwarded to the Admin.',
-              'They’ll reach out soon. You can reply here to add more info.'
-            ].join('\n')
-          );
-        } catch {
-          // user’s DMs are closed; just keep the ephemeral reply
-        }
+          await interaction.user.send([
+            '📨 Your message has been forwarded to the Admin.',
+            'You can reply here to add more info.'
+          ].join('\n'));
+        } catch { /* user DMs closed – ignore */ }
 
         await interaction.editReply({ content: '✅ Sent your message to the Admin.' });
         return;
@@ -218,12 +187,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error(err);
     if (interaction.isRepliable()) {
       const msg = (err && err.message) ? err.message : 'Unexpected error.';
-      try {
-        await interaction.reply({ content: `❌ Error: ${msg}`, ephemeral: true });
-      } catch {
-        try {
-          await interaction.editReply({ content: `❌ Error: ${msg}` });
-        } catch {}
+      try { await interaction.reply({ content: `❌ Error: ${msg}`, ephemeral: true }); }
+      catch { try { await interaction.editReply({ content: `❌ Error: ${msg}` }); } catch {}
       }
     }
   }
