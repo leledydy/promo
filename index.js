@@ -2,8 +2,8 @@
 // Features:
 // - Auto-posts & pins a support panel in SUPPORT_CHANNEL_ID
 // - "Report Server Problem" → creates a Forum post in FORUM_CHANNEL_ID
-// - "Talk to Staff/Admin" → DMs ADMIN_USER_ID with user's message AND opens a DM thread with the user
-// - Two-way relay: Admin replies (by replying to the bot's DM) → forwarded to the user; user DMs the bot → forwarded to Admin
+// - "Talk to Staff/Admin" → DMs ADMIN_USER_ID with user's message AND opens a DM with the user
+// - Two-way relay: Admin replies (by replying to bot’s DM) → forwarded to the user; user DMs the bot → forwarded to Admin
 // - Uses ephemeral:true (v14-correct), forwards attachments as links, in-memory mappings
 
 import 'dotenv/config';
