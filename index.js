@@ -4,6 +4,7 @@
 // - Auto-recreate the panel if deleted while bot is running
 // - "Report Server Problem" → creates a Forum post in FORUM_CHANNEL_ID
 // - "Talk to Staff/Admin" → DMs ADMIN_USER_ID directly (no user DMs, no fallbacks)
+// - Hardened DM delivery (plain text + embed), explicit diagnostics, anti-spam cooldown
 
 import 'dotenv/config';
 import {
@@ -45,6 +46,10 @@ const client = new Client({
 
 // Track the current panel message per guild (to auto-recreate on deletion)
 const panelMessageIdByGuild = new Map(); // guildId -> messageId
+
+// Lightweight anti-spam cooldown for button → modal (ms)
+const COOLDOWN_MS = 3000;
+const lastInteractAt = new Map(); // key: `${guildId}:${userId}:${customId}` -> timestamp
 
 /* ---------------- UI Builders ---------------- */
 function buildPanelEmbed() {
@@ -134,10 +139,26 @@ client.once(Events.ClientReady, async (c) => {
 });
 
 /* ---------------- Interaction Handlers ---------------- */
+function isOnCooldown(key) {
+  const now = Date.now();
+  const last = lastInteractAt.get(key) ?? 0;
+  if (now - last < COOLDOWN_MS) return true;
+  lastInteractAt.set(key, now);
+  return false;
+}
+
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     // Button clicks → show modals
     if (interaction.isButton()) {
+      const cooldownKey = `${interaction.guildId}:${interaction.user.id}:${interaction.customId}`;
+      if (isOnCooldown(cooldownKey)) {
+        try {
+          await interaction.reply({ content: '⏳ Please wait a moment before trying again.', ephemeral: true });
+        } catch {/* ignore */}
+        return;
+      }
+
       // Report Problem -> show modal
       if (interaction.customId === 'btn_report_problem') {
         const titleInput = new TextInputBuilder()
@@ -207,6 +228,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               `**Details:**\n${details}`
             ].join('\n')
           }
+          // If your forum requires tags, add: appliedTags: ['TAG_ID']
         });
 
         await interaction.editReply({
@@ -215,23 +237,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // DM Admin directly from talk-to-staff modal (robust + guaranteed confirmation)
+      // DM Admin directly from talk-to-staff modal (robust + diagnostics)
       if (interaction.customId === 'modal_talk_staff') {
         await interaction.deferReply({ ephemeral: true });
 
         const message = interaction.fields.getTextInputValue('ts_message').trim();
-
-        // Fetch admin and create a DM channel explicitly
-        let adminUser;
-        try {
-          adminUser = await client.users.fetch(ADMIN_USER_ID, { force: true });
-        } catch (e) {
-          console.error('Failed to fetch ADMIN_USER_ID:', e);
-          try {
-            await interaction.editReply({ content: '❌ Could not find the Admin account. Check ADMIN_USER_ID.' });
-          } catch {}
-          return;
-        }
 
         const dmEmbed = new EmbedBuilder()
           .setTitle('📩 New Message for Admin')
@@ -244,17 +254,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setColor(0x5865f2);
 
         let sentOK = true;
+        let dmChannelId = null;
+        let failureMsg = null;
+
         try {
+          // 1) Fetch admin and validate entity
+          const adminUser = await client.users.fetch(ADMIN_USER_ID, { force: true });
+          console.log(`[TalkStaff] Target admin resolved:`, {
+            id: adminUser.id,
+            tag: adminUser.tag,
+            bot: adminUser.bot
+          });
+
+          if (adminUser.bot) {
+            throw new Error('ADMIN_USER_ID points to a bot account. Bots cannot receive DMs from bots.');
+          }
+
+          // 2) Create or reuse DM channel explicitly
           const dm = await adminUser.createDM();
+          dmChannelId = dm?.id;
+
+          // 3) Send a short text first (surfaces in Requests), then the embed
+          await dm.send(`📨 You have a new message from **${interaction.user.tag}** in **${interaction.guild?.name ?? 'Unknown Server'}**.`);
           await dm.send({ embeds: [dmEmbed] });
+
         } catch (e) {
           sentOK = false;
-          console.error('Admin DM failed:', e);
+          const code = e?.code ?? e?.status ?? 'UNKNOWN';
+          console.error('Admin DM failed:', { code, message: e?.message, stack: e?.stack });
+          if (String(code) === '50007') {
+            failureMsg = 'I could not DM the Admin (they likely have DMs disabled for this server, or have blocked the bot).';
+          } else if (e?.message?.toLowerCase().includes('bot account')) {
+            failureMsg = 'ADMIN_USER_ID points to a bot account. Bots cannot receive DMs.';
+          } else {
+            failureMsg = `DM failed (code: ${code}).`;
+          }
         }
 
         const replyMsg = sentOK
-          ? '✅ Your message was sent directly to the Admin.'
-          : '⚠️ I could not DM the Admin (their DMs might be closed or the ID is wrong).';
+          ? `✅ Your message was sent to the Admin.\nIf they don’t see it, ask them to check **Inbox → Message Requests**.\nDM channel: \`${dmChannelId ?? 'unknown'}\`.`
+          : `⚠️ ${failureMsg} Please verify **ADMIN_USER_ID** and the Admin’s DM privacy settings.`;
+
         try {
           await interaction.editReply({ content: replyMsg });
         } catch {
@@ -276,12 +316,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 /* ---------------- Auto-Recreate Panel on Delete ---------------- */
 client.on(Events.MessageDelete, async (msg) => {
   try {
-    if (!msg.guildId) return;                 // ignore DMs
+    if (!msg.guildId) return;                      // ignore DMs
     if (msg.channelId !== SUPPORT_CHANNEL_ID) return; // only care about support channel
 
     const trackedId = panelMessageIdByGuild.get(msg.guildId);
     if (!trackedId) return;
-    if (msg.id !== trackedId) return;         // only if our tracked panel was deleted
+    if (msg.id !== trackedId) return;              // only if our tracked panel was deleted
 
     const guild = client.guilds.cache.get(msg.guildId);
     if (!guild) return;
