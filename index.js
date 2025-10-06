@@ -1,3 +1,10 @@
+// index.js — Discord ticketing bot (discord.js v14)
+// Features:
+// - Auto-post & pin a ticket panel in SUPPORT_CHANNEL_ID on startup
+// - Auto-recreate the panel if deleted while bot is running
+// - "Report Server Problem" → creates a Forum post in FORUM_CHANNEL_ID
+// - "Talk to Staff/Admin" → DMs ADMIN_USER_ID directly (no user DMs, no fallbacks)
+
 import 'dotenv/config';
 import {
   ActionRowBuilder,
@@ -10,17 +17,20 @@ import {
   GatewayIntentBits,
   ModalBuilder,
   Partials,
+  PermissionsBitField,
   TextInputBuilder,
   TextInputStyle
 } from 'discord.js';
 
-// Optional: simple health server so Railway shows service as “up”
-import './server.js';
+const {
+  DISCORD_TOKEN,
+  FORUM_CHANNEL_ID,
+  SUPPORT_CHANNEL_ID,
+  ADMIN_USER_ID
+} = process.env;
 
-const { DISCORD_TOKEN, FORUM_CHANNEL_ID, ADMIN_USER_ID } = process.env;
-
-if (!DISCORD_TOKEN || !FORUM_CHANNEL_ID || !ADMIN_USER_ID) {
-  console.error('Missing env vars: DISCORD_TOKEN / FORUM_CHANNEL_ID / ADMIN_USER_ID');
+if (!DISCORD_TOKEN || !FORUM_CHANNEL_ID || !SUPPORT_CHANNEL_ID || !ADMIN_USER_ID) {
+  console.error('❌ Missing required environment variables. Need DISCORD_TOKEN, FORUM_CHANNEL_ID, SUPPORT_CHANNEL_ID, ADMIN_USER_ID');
   process.exit(1);
 }
 
@@ -30,18 +40,25 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.DirectMessages
   ],
-  partials: [Partials.Channel]
+  partials: [Partials.Channel, Partials.Message] // Channel for DMs; Message for delete watcher
 });
 
-async function getForumChannel(guild) {
-  const ch = await guild.channels.fetch(FORUM_CHANNEL_ID).catch(() => null);
-  if (!ch || ch.type !== ChannelType.GuildForum) {
-    throw new Error('FORUM_CHANNEL_ID is not a Forum Channel or not found.');
-  }
-  return ch;
+// Track the current panel message per guild (to auto-recreate on deletion)
+const panelMessageIdByGuild = new Map(); // guildId -> messageId
+
+/* ---------------- UI Builders ---------------- */
+function buildPanelEmbed() {
+  return new EmbedBuilder()
+    .setTitle('🎫 Support & Reports')
+    .setDescription([
+      'Use the buttons below:',
+      '• **Report Server Problem** → creates a **Forum post** for staff to follow up.',
+      '• **Talk to Staff/Admin** → sends your message **directly to the Admin’s DMs**.'
+    ].join('\n'))
+    .setColor(0x2b2d31);
 }
 
-function panelComponents() {
+function buildPanelButtons() {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -56,27 +73,72 @@ function panelComponents() {
   ];
 }
 
-client.once(Events.ClientReady, (c) => {
-  console.log(`Logged in as ${c.user.tag}`);
+/* ---------------- Helpers ---------------- */
+async function getForumChannel(guild) {
+  const ch = await guild.channels.fetch(FORUM_CHANNEL_ID).catch(() => null);
+  if (!ch || ch.type !== ChannelType.GuildForum) {
+    throw new Error('FORUM_CHANNEL_ID is not a Forum Channel or not found.');
+  }
+  return ch;
+}
+
+async function getSupportChannel(guild) {
+  const ch = await guild.channels.fetch(SUPPORT_CHANNEL_ID).catch(() => null);
+  if (!ch || ch.type !== ChannelType.GuildText) {
+    throw new Error('SUPPORT_CHANNEL_ID is not a Text Channel or not found.');
+  }
+  return ch;
+}
+
+/**
+ * Ensure the panel exists & is pinned in SUPPORT_CHANNEL_ID.
+ * - Reuses an existing bot panel if present, pins it if needed.
+ * - Otherwise posts a fresh one and pins it.
+ * - Stores the message ID for deletion tracking.
+ */
+async function ensurePinnedPanel(guild) {
+  const channel = await getSupportChannel(guild);
+  const perms = channel.permissionsFor(guild.members.me);
+  if (!perms?.has(PermissionsBitField.Flags.SendMessages)) return null;
+
+  const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  const existing = messages?.find(m =>
+    m.author.id === guild.members.me.id &&
+    m.components?.[0]?.components?.some(c => c.customId === 'btn_report_problem') &&
+    m.components?.[0]?.components?.some(c => c.customId === 'btn_talk_staff')
+  );
+
+  if (existing) {
+    if (!existing.pinned && perms.has(PermissionsBitField.Flags.ManageMessages)) {
+      await existing.pin().catch(() => {});
+    }
+    panelMessageIdByGuild.set(guild.id, existing.id);
+    return existing;
+  }
+
+  const sent = await channel.send({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
+  if (perms.has(PermissionsBitField.Flags.ManageMessages)) {
+    await sent.pin().catch(() => {});
+  }
+  panelMessageIdByGuild.set(guild.id, sent.id);
+  return sent;
+}
+
+/* ---------------- Lifecycle ---------------- */
+client.once(Events.ClientReady, async (c) => {
+  console.log(`✅ Logged in as ${c.user.tag}`);
+  // Ensure sticky panel for all guilds on startup
+  for (const [, guild] of client.guilds.cache) {
+    ensurePinnedPanel(guild).catch(err => console.error(`ensurePinnedPanel(${guild.id}) error:`, err));
+  }
 });
 
+/* ---------------- Interaction Handlers ---------------- */
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    if (interaction.isChatInputCommand() && interaction.commandName === 'ticket-panel') {
-      const embed = new EmbedBuilder()
-        .setTitle('🎫 Support & Reports')
-        .setDescription([
-          'Use the buttons below:',
-          '• **Report Server Problem** → creates a **Forum post** for tracking.',
-          '• **Talk to Staff/Admin** → sends a **private message** to an Admin.'
-        ].join('\n'))
-        .setColor(0x2b2d31);
-
-      await interaction.reply({ embeds: [embed], components: panelComponents() });
-      return;
-    }
-
+    // Button clicks → show modals
     if (interaction.isButton()) {
+      // Report Problem -> show modal
       if (interaction.customId === 'btn_report_problem') {
         const modal = new ModalBuilder()
           .setCustomId('modal_report_problem')
@@ -98,13 +160,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setMaxLength(1500)
           .setPlaceholder('What happened? When? Any error codes? Steps to reproduce?');
 
-        await interaction.showModal(modal.addComponents(
-          new ActionRowBuilder().addComponents(titleInput),
-          new ActionRowBuilder().addComponents(detailInput)
-        ));
+        const row1 = new ActionRowBuilder().addComponents(titleInput);
+        const row2 = new ActionRowBuilder().addComponents(detailInput);
+
+        const reportModal = new ModalBuilder()
+          .setCustomId('modal_report_problem')
+          .setTitle('Report Server Problem')
+          .addComponents(row1, row2);
+
+        await interaction.showModal(reportModal);
         return;
       }
 
+      // Talk to Staff/Admin -> show modal (later DMs admin)
       if (interaction.customId === 'btn_talk_staff') {
         const modal = new ModalBuilder()
           .setCustomId('modal_talk_staff')
@@ -116,23 +184,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setStyle(TextInputStyle.Paragraph)
           .setRequired(true)
           .setMaxLength(1500)
-          .setPlaceholder('How can we help?');
+          .setPlaceholder('Write what you want to tell the admin');
 
-        await interaction.showModal(modal.addComponents(
-          new ActionRowBuilder().addComponents(msgInput)
-        ));
+        const row = new ActionRowBuilder().addComponents(msgInput);
+
+        const talkModal = new ModalBuilder()
+          .setCustomId('modal_talk_staff')
+          .setTitle('Message Admin / Staff')
+          .addComponents(row);
+
+        await interaction.showModal(talkModal);
         return;
       }
     }
 
+    // Modal submits → process actions
     if (interaction.isModalSubmit()) {
+      // Create forum post from report modal
       if (interaction.customId === 'modal_report_problem') {
         await interaction.deferReply({ ephemeral: true });
 
         const title = interaction.fields.getTextInputValue('rp_title').trim();
         const details = interaction.fields.getTextInputValue('rp_details').trim();
-        const forum = await getForumChannel(interaction.guild);
 
+        const forum = await getForumChannel(interaction.guild);
         const thread = await forum.threads.create({
           name: `${title} — by ${interaction.user.tag}`,
           message: {
@@ -141,16 +216,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
               `**Title:** ${title}`,
               `**Details:**\n${details}`
             ].join('\n')
-          },
-          appliedTags: []
+          }
         });
 
         await interaction.editReply({
-          content: `✅ Your report has been posted: ${thread?.toString() || thread?.url || 'created thread'}.`
+          content: `✅ Your report has been posted: ${thread.toString() || thread.url}`
         });
         return;
       }
 
+      // DM Admin directly from talk-to-staff modal
       if (interaction.customId === 'modal_talk_staff') {
         await interaction.deferReply({ ephemeral: true });
 
@@ -158,40 +233,58 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const adminUser = await client.users.fetch(ADMIN_USER_ID);
 
         const dmEmbed = new EmbedBuilder()
-          .setTitle('👤 New message to Admin')
+          .setTitle('📩 New Message for Admin')
           .addFields(
             { name: 'From', value: `${interaction.user} (${interaction.user.tag})` },
+            { name: 'Server', value: interaction.guild?.name || 'Unknown' },
             { name: 'Message', value: message || '(no content)' }
           )
-          .setTimestamp();
+          .setTimestamp()
+          .setColor(0x5865f2);
 
-        await adminUser.send({ embeds: [dmEmbed] }).catch(async () => {
-          await interaction.editReply({
-            content: '⚠️ Could not DM the admin (DMs might be closed). Please ping a staff member.'
-          });
+        let dmFailed = false;
+        await adminUser.send({ embeds: [dmEmbed] }).catch(() => { dmFailed = true; });
+
+        if (dmFailed) {
+          await interaction.editReply({ content: '⚠️ Could not DM the Admin (their DMs might be closed).' });
           return;
-        });
+        }
 
-        try {
-          await interaction.user.send([
-            '📨 Your message has been forwarded to the Admin.',
-            'You can reply here to add more info.'
-          ].join('\n'));
-        } catch { /* user DMs closed – ignore */ }
-
-        await interaction.editReply({ content: '✅ Sent your message to the Admin.' });
+        await interaction.editReply({ content: '✅ Your message was sent directly to the Admin.' });
         return;
       }
     }
   } catch (err) {
     console.error(err);
     if (interaction.isRepliable()) {
-      const msg = (err && err.message) ? err.message : 'Unexpected error.';
+      const msg = err?.message || 'Unexpected error.';
       try { await interaction.reply({ content: `❌ Error: ${msg}`, ephemeral: true }); }
-      catch { try { await interaction.editReply({ content: `❌ Error: ${msg}` }); } catch {}
-      }
+      catch { try { await interaction.editReply({ content: `❌ Error: ${msg}` }); } catch {} }
     }
   }
 });
 
+/* ---------------- Auto-Recreate Panel on Delete ---------------- */
+client.on(Events.MessageDelete, async (msg) => {
+  try {
+    if (!msg.guildId) return;                 // ignore DMs
+    if (msg.channelId !== SUPPORT_CHANNEL_ID) return; // only care about support channel
+
+    const trackedId = panelMessageIdByGuild.get(msg.guildId);
+    if (!trackedId) return;
+    if (msg.id !== trackedId) return;         // only if our tracked panel was deleted
+
+    const guild = client.guilds.cache.get(msg.guildId);
+    if (!guild) return;
+
+    const recreated = await ensurePinnedPanel(guild);
+    if (recreated?.id) {
+      panelMessageIdByGuild.set(guild.id, recreated.id);
+    }
+  } catch (e) {
+    console.error('MessageDelete watcher error:', e);
+  }
+});
+
+/* ---------------- Login ---------------- */
 client.login(DISCORD_TOKEN);
