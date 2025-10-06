@@ -5,8 +5,11 @@
 // - "Report Server Problem" → creates a Forum post in FORUM_CHANNEL_ID
 // - "Talk to Staff/Admin" → DMs ADMIN_USER_ID directly (no user DMs, no fallbacks)
 // - Hardened DM delivery (plain text + embed), explicit diagnostics, anti-spam cooldown
+// - Ephemeral replies use MessageFlags.Ephemeral (Discord deprecation fix)
+// - Minimal healthcheck HTTP server + graceful shutdown (helps avoid SIGTERM on PaaS)
 
 import 'dotenv/config';
+import http from 'node:http';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -16,6 +19,7 @@ import {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  MessageFlags,
   ModalBuilder,
   Partials,
   PermissionsBitField,
@@ -154,7 +158,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const cooldownKey = `${interaction.guildId}:${interaction.user.id}:${interaction.customId}`;
       if (isOnCooldown(cooldownKey)) {
         try {
-          await interaction.reply({ content: '⏳ Please wait a moment before trying again.', ephemeral: true });
+          await interaction.reply({ content: '⏳ Please wait a moment before trying again.', flags: MessageFlags.Ephemeral });
         } catch {/* ignore */}
         return;
       }
@@ -213,7 +217,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isModalSubmit()) {
       // Create forum post from report modal
       if (interaction.customId === 'modal_report_problem') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         const title = interaction.fields.getTextInputValue('rp_title').trim();
         const details = interaction.fields.getTextInputValue('rp_details').trim();
@@ -239,7 +243,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       // DM Admin directly from talk-to-staff modal (robust + diagnostics)
       if (interaction.customId === 'modal_talk_staff') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
         const message = interaction.fields.getTextInputValue('ts_message').trim();
 
@@ -298,7 +302,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         try {
           await interaction.editReply({ content: replyMsg });
         } catch {
-          try { await interaction.followUp({ content: replyMsg, ephemeral: true }); } catch {}
+          try { await interaction.followUp({ content: replyMsg, flags: MessageFlags.Ephemeral }); } catch {}
         }
         return;
       }
@@ -307,7 +311,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error(err);
     if (interaction.isRepliable()) {
       const msg = err?.message || 'Unexpected error.';
-      try { await interaction.reply({ content: `❌ Error: ${msg}`, ephemeral: true }); }
+      try { await interaction.reply({ content: `❌ Error: ${msg}`, flags: MessageFlags.Ephemeral }); }
       catch { try { await interaction.editReply({ content: `❌ Error: ${msg}` }); } catch {} }
     }
   }
@@ -316,12 +320,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 /* ---------------- Auto-Recreate Panel on Delete ---------------- */
 client.on(Events.MessageDelete, async (msg) => {
   try {
-    if (!msg.guildId) return;                      // ignore DMs
+    if (!msg.guildId) return;                         // ignore DMs
     if (msg.channelId !== SUPPORT_CHANNEL_ID) return; // only care about support channel
 
     const trackedId = panelMessageIdByGuild.get(msg.guildId);
     if (!trackedId) return;
-    if (msg.id !== trackedId) return;              // only if our tracked panel was deleted
+    if (msg.id !== trackedId) return;                 // only if our tracked panel was deleted
 
     const guild = client.guilds.cache.get(msg.guildId);
     if (!guild) return;
@@ -333,6 +337,30 @@ client.on(Events.MessageDelete, async (msg) => {
   } catch (e) {
     console.error('MessageDelete watcher error:', e);
   }
+});
+
+/* ---------------- Minimal healthcheck HTTP server ---------------- */
+const PORT = process.env.PORT || 3000;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'content-type': 'text/plain' });
+  res.end('OK\n');
+});
+server.listen(PORT, () => {
+  console.log(`🌐 Healthcheck server listening on :${PORT}`);
+});
+
+// --- graceful shutdown diagnostics
+process.on('SIGTERM', () => {
+  console.log('⚠️  Received SIGTERM. Closing HTTP server and logging out...');
+  server.close(() => console.log('🌐 HTTP server closed.'));
+  client.destroy();
+  process.exit(0);
+});
+process.on('SIGINT', () => {
+  console.log('⚠️  Received SIGINT. Closing...');
+  server.close(() => console.log('🌐 HTTP server closed.'));
+  client.destroy();
+  process.exit(0);
 });
 
 /* ---------------- Login ---------------- */
