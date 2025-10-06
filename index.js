@@ -1,10 +1,4 @@
-// index.js — Ticketing + Two-Way Relay + User DM (discord.js v14)
-// Features:
-// - Auto-posts & pins a support panel in SUPPORT_CHANNEL_ID
-// - "Report Server Problem" → creates a Forum post in FORUM_CHANNEL_ID
-// - "Talk to Staff/Admin" → DMs ADMIN_USER_ID with user's message AND opens a DM with the user
-// - Two-way relay: Admin replies (by replying to bot’s DM) → forwarded to the user; user DMs the bot → forwarded to Admin
-// - Uses ephemeral:true (v14-correct), forwards attachments as links, in-memory mappings
+// index.js — Ticketing + Two-Way Relay + User DM with robust DM fallbacks (discord.js v14)
 
 import 'dotenv/config';
 import {
@@ -42,15 +36,14 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.MessageContent // needed to read DM text for relay
+    GatewayIntentBits.MessageContent // reading DM text for relay
   ],
   partials: [Partials.Channel, Partials.Message, Partials.User]
 });
 
 // Track pinned panel per guild
 const panelMessageIdByGuild = new Map();
-
-// Simple in-memory conversation anchors (resets on restart)
+// In-memory anchors for admin reply routing
 const lastAdminPromptMsgIdByUser = new Map();
 
 /* ---------- UI Builders ---------- */
@@ -90,7 +83,7 @@ function buildAdminInboxEmbed({ user, guildName, message, attachments = [] }) {
       { name: 'Message', value: message || '(no content)', inline: false },
       ...(attLines ? [{ name: 'Attachments', value: attLines, inline: false }] : [])
     )
-    .setFooter({ text: `UID:${user.id}` }) // used to route admin replies
+    .setFooter({ text: `UID:${user.id}` })
     .setTimestamp()
     .setColor(0x5865f2);
 }
@@ -260,7 +253,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // DIRECT DM to admin + record for relay + DM the user (create user thread)
+      // Talk to Staff/Admin: DM admin + open DM with user (with robust fallbacks)
       if (interaction.customId === 'modal_talk_staff') {
         await interaction.deferReply({ ephemeral: true });
 
@@ -275,7 +268,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
           // --- DM the admin ---
           const adminDm = await adminUser.createDM();
-
           await adminDm.send(`📨 New message from **${interaction.user.tag}** in **${interaction.guild?.name ?? 'Unknown Server'}**.`);
           const adminMsg = await adminDm.send({
             embeds: [
@@ -283,7 +275,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 user: interaction.user,
                 guildName: interaction.guild?.name,
                 message: text,
-                attachments: [] // none from modal
+                attachments: []
               })
             ]
           });
@@ -291,49 +283,71 @@ client.on(Events.InteractionCreate, async (interaction) => {
           // Anchor for reply routing
           lastAdminPromptMsgIdByUser.set(interaction.user.id, adminMsg.id);
 
-          // --- DM the user (open/confirm their DM thread with the bot) ---
+          // --- DM the user (confirm + keep thread) ---
+          const confirmEmbed = buildUserConfirmEmbed({
+            adminUser,
+            message: text,
+            guildName: interaction.guild?.name
+          });
+
+          let userDmOk = false;
           try {
-            const userDm = await interaction.user.createDM();
-            await userDm.send({
-              embeds: [
-                buildUserConfirmEmbed({
-                  adminUser,
-                  message: text,
-                  guildName: interaction.guild?.name
-                })
-              ]
-            });
-          } catch (udmErr) {
-            // user DMs might be off; ignore
-            console.warn('User DM failed (confirmation):', udmErr?.code || udmErr?.message || udmErr);
+            await interaction.user.send({ embeds: [confirmEmbed] });
+            userDmOk = true;
+          } catch (e1) {
+            // Try via createDM as a fallback
+            try {
+              const udm = await interaction.user.createDM();
+              await udm.send({ embeds: [confirmEmbed] });
+              userDmOk = true;
+            } catch (e2) {
+              const code = String(e2?.code ?? e1?.code ?? 'UNKNOWN');
+              console.warn('User DM failed:', code, e2?.message || e1?.message || e2 || e1);
+
+              // If DMs are disabled for this server (50007), explain how to enable
+              if (code === '50007') {
+                await interaction.editReply({
+                  content: [
+                    '✅ Sent your message to the Admin.',
+                    '⚠️ I couldn’t DM you. To receive replies in DM, please enable DMs for this server:',
+                    '• On desktop: Right-click the server → **Privacy Settings** → enable **Allow direct messages from server members**.',
+                    '• Or globally: **User Settings** → **Privacy & Safety** → enable **Allow direct messages from server members** (Server Privacy Defaults).',
+                    'Then DM me once, and I’ll keep the thread open.'
+                  ].join('\n')
+                });
+              }
+            }
           }
 
-          await interaction.editReply({
-            content: '✅ Your message was sent directly to the Admin. I also opened a DM with you — feel free to continue here.'
-          });
+          if (userDmOk) {
+            await interaction.editReply({
+              content: '✅ Your message was sent to the Admin. I also opened a DM with you — feel free to continue there.'
+            });
+          } else if (!interaction.replied && !interaction.deferred) {
+            await interaction.reply({ content: '✅ Sent to Admin. (Could not DM you — check your DM privacy settings.)', ephemeral: true });
+          }
         } catch (e) {
           const code = e?.code ?? e?.status ?? 'UNKNOWN';
           console.error('Admin DM failed:', { code, message: e?.message });
-
-          const reason = String(code) === '50007'
-            ? 'I could not DM the Admin (their DMs might be disabled for this server, or the bot is blocked).'
-            : `DM failed (code: ${code}).`;
 
           // Optional: discreet fallback ping in the support channel
           try {
             const support = await getSupportChannel(interaction.guild);
             await support.send({
-              content: `🔔 Heads up <@${ADMIN_ID}>: **${interaction.user.tag}** tried to DM you via the support panel but it failed.\n**Message:** ${text}`
+              content: `🔔 Heads up <@${ADMIN_ID}>: **${interaction.user.tag}** tried to DM you via the support panel but it failed.\n**Message:** ${interaction.fields.getTextInputValue('ts_message').trim()}`
             });
           } catch {}
 
-          // Also try to DM the user with info
+          // Also try to DM the user with info (may also fail if 50007)
           try {
-            const userDm = await interaction.user.createDM();
-            await userDm.send(`⚠️ I couldn’t deliver your message to the admin right now. Please try again later or post in the support channel.`);
+            await interaction.user.send('⚠️ I couldn’t deliver your message to the admin right now. Please try again later or post in the support channel.');
           } catch {}
 
-          await interaction.editReply({ content: `⚠️ ${reason}` });
+          await interaction.editReply({
+            content: String(code) === '50007'
+              ? '⚠️ I could not DM the Admin (their DMs might be disabled).'
+              : `⚠️ DM failed (code: ${code}).`
+          });
         }
         return;
       }
@@ -358,7 +372,7 @@ client.on(Events.MessageCreate, async (msg) => {
     // 1) ADMIN → USER (admin replies to the bot's prior DM embed)
     if (isDm && msg.author.id === ADMIN_ID) {
       const refId = msg.reference?.messageId;
-      if (!refId) return; // require using Discord's "Reply" to a UID-tagged message
+      if (!refId) return; // must reply to the UID-tagged message
 
       let referenced;
       try { referenced = await msg.channel.messages.fetch(refId); } catch {}
@@ -374,18 +388,22 @@ client.on(Events.MessageCreate, async (msg) => {
         return;
       }
 
-      const userDm = await targetUser.createDM();
-      const attachmentUrls = [...msg.attachments.values()].map(a => ({ url: a.url }));
-      await userDm.send({
-        content: `✉️ You received a reply from the Admin.`,
-        embeds: [
-          buildUserFromAdminEmbed({
-            adminUser: msg.author,
-            message: msg.content?.trim(),
-            attachments: attachmentUrls
-          })
-        ]
+      const replyEmbed = buildUserFromAdminEmbed({
+        adminUser: msg.author,
+        message: msg.content?.trim(),
+        attachments: [...msg.attachments.values()].map(a => ({ url: a.url }))
       });
+
+      try {
+        await targetUser.send({ content: '✉️ You received a reply from the Admin.', embeds: [replyEmbed] });
+      } catch (e1) {
+        // If user DMs are closed, inform admin so they can follow up in-server
+        const code = String(e1?.code ?? 'UNKNOWN');
+        console.warn('Forward to user failed:', code, e1?.message || e1);
+        if (code === '50007') {
+          await msg.channel.send(`⚠️ I can’t DM <@${targetUserId}> (DMs disabled or blocked). Please follow up in the server.`);
+        }
+      }
       return;
     }
 
@@ -395,7 +413,7 @@ client.on(Events.MessageCreate, async (msg) => {
       if (!adminUser) return;
 
       const dm = await adminUser.createDM();
-      const attachmentUrls = [...msg.attachments.values()].map(a => ({ url: a.url }));
+      const attachments = [...msg.attachments.values()].map(a => ({ url: a.url }));
 
       const anchorMsgId = lastAdminPromptMsgIdByUser.get(msg.author.id);
       if (!anchorMsgId) {
@@ -406,7 +424,7 @@ client.on(Events.MessageCreate, async (msg) => {
               user: msg.author,
               guildName: 'Direct Message',
               message: msg.content?.trim(),
-              attachments: attachmentUrls
+              attachments
             })
           ]
         });
@@ -418,7 +436,7 @@ client.on(Events.MessageCreate, async (msg) => {
               user: msg.author,
               guildName: 'Direct Message',
               message: msg.content?.trim(),
-              attachments: attachmentUrls
+              attachments
             })
           ]
         });
