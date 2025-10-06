@@ -1,4 +1,11 @@
-// index.js — Ticketing + Two-Way Relay + User DM with robust DM fallbacks (discord.js v14)
+// index.js — Ticketing + Two-Way Relay + User DM with robust fallback (discord.js v14)
+// Features:
+// - Auto-posts & pins a support panel in SUPPORT_CHANNEL_ID
+// - "Report Server Problem" → creates a Forum post in FORUM_CHANNEL_ID
+// - "Talk to Staff/Admin" → DMs ADMIN_USER_ID with user's message
+//   -> also attempts to DM the user; if DM fails, auto-creates a private support thread with the user
+// - Two-way relay: Admin replies (by replying to bot’s DM) → forwarded to the user; user DMs the bot → forwarded to Admin
+// - Uses ephemeral:true (v14-correct), forwards attachments as links, in-memory mappings
 
 import 'dotenv/config';
 import {
@@ -36,14 +43,15 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.MessageContent // reading DM text for relay
+    GatewayIntentBits.MessageContent // needed to read DM text for relay
   ],
   partials: [Partials.Channel, Partials.Message, Partials.User]
 });
 
 // Track pinned panel per guild
 const panelMessageIdByGuild = new Map();
-// In-memory anchors for admin reply routing
+
+// Simple in-memory conversation anchors (resets on restart)
 const lastAdminPromptMsgIdByUser = new Map();
 
 /* ---------- UI Builders ---------- */
@@ -83,7 +91,7 @@ function buildAdminInboxEmbed({ user, guildName, message, attachments = [] }) {
       { name: 'Message', value: message || '(no content)', inline: false },
       ...(attLines ? [{ name: 'Attachments', value: attLines, inline: false }] : [])
     )
-    .setFooter({ text: `UID:${user.id}` })
+    .setFooter({ text: `UID:${user.id}` }) // used to route admin replies
     .setTimestamp()
     .setColor(0x5865f2);
 }
@@ -133,6 +141,61 @@ async function getSupportChannel(guild) {
   const ch = await guild.channels.fetch(SUPPORT_CHANNEL_ID).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildText) throw new Error('SUPPORT_CHANNEL_ID is not a Text Channel or not found.');
   return ch;
+}
+
+/* ---------- Fallback: DM the user or open a private support thread ---------- */
+async function openUserDmOrFallbackThread({
+  guild,
+  user,
+  adminUser,
+  supportChannelId,
+  confirmEmbed
+}) {
+  // 1) Try user.send (fast path)
+  try {
+    await user.send({ embeds: [confirmEmbed] });
+    return { mode: 'dm', thread: null };
+  } catch (e1) {
+    console.warn('user.send failed:', e1?.code, e1?.message);
+  }
+
+  // 2) Try createDM + send
+  try {
+    const udm = await user.createDM();
+    await udm.send({ embeds: [confirmEmbed] });
+    return { mode: 'dm', thread: null };
+  } catch (e2) {
+    const code = String(e2?.code ?? 'UNKNOWN');
+    console.warn('createDM/send failed:', code, e2?.message);
+
+    // 3) Fallback: create a private thread in SUPPORT_CHANNEL_ID
+    try {
+      const support = await guild.channels.fetch(supportChannelId);
+      if (!support || support.type !== ChannelType.GuildText) throw new Error('Support channel is not a text channel');
+
+      // Requires private threads enabled + bot permissions
+      const thread = await support.threads.create({
+        name: `support-${user.username}`.slice(0, 90),
+        type: ChannelType.PrivateThread,
+        invitable: false,
+        autoArchiveDuration: 1440
+      });
+
+      // Add user and (optionally) admin
+      try { await thread.members.add(user.id); } catch (eAddUser) { console.warn('Add user to thread failed:', eAddUser?.code, eAddUser?.message); }
+      try { if (adminUser) await thread.members.add(adminUser.id); } catch (eAddAdmin) { console.warn('Add admin to thread failed:', eAddAdmin?.code, eAddAdmin?.message); }
+
+      await thread.send({
+        content: `👋 Hi ${user}, I couldn’t DM you (likely privacy settings). Let’s continue here securely.`,
+        embeds: [confirmEmbed]
+      });
+
+      return { mode: 'thread', thread };
+    } catch (e3) {
+      console.error('Private thread fallback failed:', e3?.code, e3?.message);
+      throw e2; // bubble original DM error
+    }
+  }
 }
 
 /* ---------- Ensure Panel Exists & Pinned ---------- */
@@ -253,7 +316,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // Talk to Staff/Admin: DM admin + open DM with user (with robust fallbacks)
+      // Talk to Staff/Admin: DM admin + open DM with user (fallback to private thread if DM fails)
       if (interaction.customId === 'modal_talk_staff') {
         await interaction.deferReply({ ephemeral: true });
 
@@ -275,7 +338,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 user: interaction.user,
                 guildName: interaction.guild?.name,
                 message: text,
-                attachments: []
+                attachments: [] // none from modal
               })
             ]
           });
@@ -283,70 +346,62 @@ client.on(Events.InteractionCreate, async (interaction) => {
           // Anchor for reply routing
           lastAdminPromptMsgIdByUser.set(interaction.user.id, adminMsg.id);
 
-          // --- DM the user (confirm + keep thread) ---
+          // --- Confirm to user: try DM, else fallback to private thread
           const confirmEmbed = buildUserConfirmEmbed({
             adminUser,
             message: text,
             guildName: interaction.guild?.name
           });
 
-          let userDmOk = false;
+          let deliveredWhere = 'dm';
           try {
-            await interaction.user.send({ embeds: [confirmEmbed] });
-            userDmOk = true;
-          } catch (e1) {
-            // Try via createDM as a fallback
-            try {
-              const udm = await interaction.user.createDM();
-              await udm.send({ embeds: [confirmEmbed] });
-              userDmOk = true;
-            } catch (e2) {
-              const code = String(e2?.code ?? e1?.code ?? 'UNKNOWN');
-              console.warn('User DM failed:', code, e2?.message || e1?.message || e2 || e1);
-
-              // If DMs are disabled for this server (50007), explain how to enable
-              if (code === '50007') {
-                await interaction.editReply({
-                  content: [
-                    '✅ Sent your message to the Admin.',
-                    '⚠️ I couldn’t DM you. To receive replies in DM, please enable DMs for this server:',
-                    '• On desktop: Right-click the server → **Privacy Settings** → enable **Allow direct messages from server members**.',
-                    '• Or globally: **User Settings** → **Privacy & Safety** → enable **Allow direct messages from server members** (Server Privacy Defaults).',
-                    'Then DM me once, and I’ll keep the thread open.'
-                  ].join('\n')
-                });
-              }
-            }
-          }
-
-          if (userDmOk) {
-            await interaction.editReply({
-              content: '✅ Your message was sent to the Admin. I also opened a DM with you — feel free to continue there.'
+            const res = await openUserDmOrFallbackThread({
+              guild: interaction.guild,
+              user: interaction.user,
+              adminUser,
+              supportChannelId: SUPPORT_CHANNEL_ID,
+              confirmEmbed
             });
-          } else if (!interaction.replied && !interaction.deferred) {
-            await interaction.reply({ content: '✅ Sent to Admin. (Could not DM you — check your DM privacy settings.)', ephemeral: true });
+            deliveredWhere = res.mode; // 'dm' or 'thread'
+          } catch (eDM) {
+            const code = String(eDM?.code ?? 'UNKNOWN');
+            console.warn('All user delivery paths failed:', code, eDM?.message);
+
+            // Optional: notify admin so they follow up in-server
+            try {
+              const support = await getSupportChannel(interaction.guild);
+              await support.send({
+                content: `⚠️ Couldn’t DM <@${interaction.user.id}> and couldn’t create a fallback thread automatically.\n**Message they sent:** ${text}`
+              });
+            } catch {}
           }
+
+          await interaction.editReply({
+            content:
+              deliveredWhere === 'dm'
+                ? '✅ Your message was sent to the Admin. I also opened a DM with you — feel free to continue there.'
+                : '✅ Your message was sent to the Admin. I couldn’t DM you, so I opened a **private support thread** with you instead.'
+          });
         } catch (e) {
           const code = e?.code ?? e?.status ?? 'UNKNOWN';
-          console.error('Admin DM failed:', { code, message: e?.message });
+          console.error('Admin DM or user notify failed:', { code, message: e?.message });
 
-          // Optional: discreet fallback ping in the support channel
+          // Discreet ping to admin in support channel
           try {
             const support = await getSupportChannel(interaction.guild);
             await support.send({
-              content: `🔔 Heads up <@${ADMIN_ID}>: **${interaction.user.tag}** tried to DM you via the support panel but it failed.\n**Message:** ${interaction.fields.getTextInputValue('ts_message').trim()}`
+              content: `🔔 Heads up <@${ADMIN_ID}>: **${interaction.user.tag}** tried to DM you via the support panel but it failed.\n**Message:** ${text}`
             });
           } catch {}
 
-          // Also try to DM the user with info (may also fail if 50007)
-          try {
-            await interaction.user.send('⚠️ I couldn’t deliver your message to the admin right now. Please try again later or post in the support channel.');
-          } catch {}
+          // Try to DM the user about failure (may still fail)
+          try { await interaction.user.send('⚠️ I couldn’t deliver your message to the admin right now. Please try again later or post in the support channel.'); } catch {}
 
           await interaction.editReply({
-            content: String(code) === '50007'
-              ? '⚠️ I could not DM the Admin (their DMs might be disabled).'
-              : `⚠️ DM failed (code: ${code}).`
+            content:
+              String(code) === '50007'
+                ? '⚠️ I could not DM the Admin (their DMs might be disabled).'
+                : `⚠️ DM failed (code: ${code}).`
           });
         }
         return;
