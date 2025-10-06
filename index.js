@@ -1,8 +1,14 @@
-// index.js — Minimal ticketing bot (discord.js v14)
-// - Autoposts & pins a panel in SUPPORT_CHANNEL_ID
+// index.js — Ticketing + Two-way Relay (discord.js v14)
+// Panel in SUPPORT_CHANNEL_ID
 // - "Report Server Problem" → creates a Forum post in FORUM_CHANNEL_ID
-// - "Talk to Staff/Admin" → creates a DM with ADMIN_USER_ID and sends the message
-// - Uses MessageFlags.Ephemeral (no deprecated 'ephemeral' option)
+// - "Talk to Staff/Admin" → collects a message and DMs ADMIN_USER_ID
+// Two-way relay:
+// - Admin replies in DM *using the reply feature* to the bot's "From <user>" message → bot forwards to that user
+// - Users can DM the bot later → bot relays to Admin
+// Notes:
+// - Uses ephemeral:true (correct in v14)
+// - Forwards attachments as links
+// - In-memory mapping for convenience (resets on restart)
 
 import 'dotenv/config';
 import {
@@ -14,7 +20,6 @@ import {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
-  MessageFlags,
   ModalBuilder,
   Partials,
   PermissionsBitField,
@@ -38,13 +43,18 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.DirectMessages
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent // needed to read DM text content
   ],
-  partials: [Partials.Channel, Partials.Message]
+  partials: [Partials.Channel, Partials.Message, Partials.User]
 });
 
-// Keep track of the pinned panel so we can recreate it if deleted
+// Track pinned panel
 const panelMessageIdByGuild = new Map();
+
+// Simple in-memory "conversation" cache
+// Maps a userId -> last admin DM messageId that presented user's content (helps admin reply without ambiguity)
+const lastAdminPromptMsgIdByUser = new Map();
 
 /* ---------- UI Builders ---------- */
 function buildPanelEmbed() {
@@ -90,7 +100,6 @@ async function ensurePinnedPanel(guild) {
   const perms = channel.permissionsFor(guild.members.me);
   if (!perms?.has(PermissionsBitField.Flags.SendMessages)) return null;
 
-  // Look for existing panel from this bot
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
   const existing = messages?.find(m =>
     m.author.id === guild.members.me.id &&
@@ -106,7 +115,6 @@ async function ensurePinnedPanel(guild) {
     return existing;
   }
 
-  // Post fresh panel
   const sent = await channel.send({ embeds: [buildPanelEmbed()], components: buildPanelButtons() });
   if (perms.has(PermissionsBitField.Flags.ManageMessages)) {
     await sent.pin().catch(() => {});
@@ -122,6 +130,42 @@ client.once(Events.ClientReady, async (c) => {
     ensurePinnedPanel(guild).catch(err => console.error(`ensurePinnedPanel(${guild.id}) error:`, err));
   }
 });
+
+/* ---------- Helpers: Relay Formatting ---------- */
+function buildAdminInboxEmbed({ user, guildName, message, attachments = [] }) {
+  const attLines = attachments.map((a, i) => `• [Attachment ${i + 1}](${a.url})`).join('\n');
+  return new EmbedBuilder()
+    .setTitle('📩 Message for Admin')
+    .addFields(
+      { name: 'From', value: `${user} (${user.tag})`, inline: false },
+      { name: 'Server', value: guildName || 'Unknown', inline: false },
+      { name: 'Message', value: message || '(no content)', inline: false },
+      ...(attLines ? [{ name: 'Attachments', value: attLines, inline: false }] : [])
+    )
+    .setFooter({ text: `UID:${user.id}` }) // <-- critical: used to resolve replies
+    .setTimestamp()
+    .setColor(0x5865f2);
+}
+
+function buildUserFromAdminEmbed({ adminUser, message, attachments = [] }) {
+  const attLines = attachments.map((a, i) => `• [Attachment ${i + 1}](${a.url})`).join('\n');
+  return new EmbedBuilder()
+    .setTitle('👨‍✈️ Reply from Admin')
+    .addFields(
+      { name: 'From', value: `${adminUser} (${adminUser.tag})`, inline: false },
+      { name: 'Message', value: message || '(no content)', inline: false },
+      ...(attLines ? [{ name: 'Attachments', value: attLines, inline: false }] : [])
+    )
+    .setTimestamp()
+    .setColor(0x2b2d31);
+}
+
+function getUidFromEmbedFooter(msg) {
+  const emb = msg.embeds?.[0];
+  const footerText = emb?.footer?.text || '';
+  const m = footerText.match(/UID:(\d{5,})/);
+  return m?.[1] || null;
+}
 
 /* ---------- Interaction Handling ---------- */
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -180,7 +224,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isModalSubmit()) {
       // Forum post creator
       if (interaction.customId === 'modal_report_problem') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.deferReply({ ephemeral: true });
 
         const title = interaction.fields.getTextInputValue('rp_title').trim();
         const details = interaction.fields.getTextInputValue('rp_details').trim();
@@ -199,18 +243,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
 
         await interaction.editReply({
-          content: `✅ Your report has been posted: ${thread.toString() || thread.url}`
+          content: `✅ Your report has been posted: ${thread?.toString() || thread?.url || '(thread created)'}`
         });
         return;
       }
 
-      // DIRECT DM to admin (simple + direct)
+      // DIRECT DM to admin + record for relay
       if (interaction.customId === 'modal_talk_staff') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        await interaction.deferReply({ ephemeral: true });
 
-        const message = interaction.fields.getTextInputValue('ts_message').trim();
-
-        // Sanitize ADMIN_USER_ID to ensure it's numeric
+        const text = interaction.fields.getTextInputValue('ts_message').trim();
         const adminId = String(ADMIN_USER_ID).replace(/\D/g, '');
 
         try {
@@ -220,31 +262,43 @@ client.on(Events.InteractionCreate, async (interaction) => {
             return;
           }
 
-          // Create (or reuse) a DM channel and send a short line + embed
           const dm = await adminUser.createDM();
 
+          // Short line for context
           await dm.send(`📨 New message from **${interaction.user.tag}** in **${interaction.guild?.name ?? 'Unknown Server'}**.`);
-          const dmEmbed = new EmbedBuilder()
-            .setTitle('📩 Message for Admin')
-            .addFields(
-              { name: 'From', value: `${interaction.user} (${interaction.user.tag})` },
-              { name: 'Server', value: interaction.guild?.name || 'Unknown' },
-              { name: 'Message', value: message || '(no content)' }
-            )
-            .setTimestamp()
-            .setColor(0x5865f2);
-          await dm.send({ embeds: [dmEmbed] });
 
-          await interaction.editReply({ content: '✅ Your message was sent directly to the Admin.' });
+          // Send the main embed and remember message id for reply-based routing
+          const adminMsg = await dm.send({
+            embeds: [
+              buildAdminInboxEmbed({
+                user: interaction.user,
+                guildName: interaction.guild?.name,
+                message: text,
+                attachments: [] // from modal, none
+              })
+            ]
+          });
+
+          lastAdminPromptMsgIdByUser.set(interaction.user.id, adminMsg.id);
+
+          await interaction.editReply({ content: '✅ Your message was sent directly to the Admin. You can also DM me later to continue the conversation.' });
         } catch (e) {
           const code = e?.code ?? e?.status ?? 'UNKNOWN';
           console.error('Admin DM failed:', { code, message: e?.message });
-          // 50007 = Cannot send messages to this user (DMs off or blocked)
-          const human =
-            String(code) === '50007'
-              ? 'I could not DM the Admin (their DMs might be disabled for this server, or the bot is blocked).'
-              : `DM failed (code: ${code}).`;
-          await interaction.editReply({ content: `⚠️ ${human}` });
+
+          const reason = String(code) === '50007'
+            ? 'I could not DM the Admin (their DMs might be disabled for this server, or the bot is blocked).'
+            : `DM failed (code: ${code}).`;
+
+          // Optional: discreet fallback ping in the support channel
+          try {
+            const support = await getSupportChannel(interaction.guild);
+            await support.send({
+              content: `🔔 Heads up <@${adminId}>: **${interaction.user.tag}** tried to DM you via the support panel but it failed.\n**Message:** ${text}`
+            });
+          } catch {}
+
+          await interaction.editReply({ content: `⚠️ ${reason}` });
         }
         return;
       }
@@ -253,9 +307,103 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error(err);
     if (interaction.isRepliable()) {
       const msg = err?.message || 'Unexpected error.';
-      try { await interaction.reply({ content: `❌ Error: ${msg}`, flags: MessageFlags.Ephemeral }); }
+      try { await interaction.reply({ content: `❌ Error: ${msg}`, ephemeral: true }); }
       catch { try { await interaction.editReply({ content: `❌ Error: ${msg}` }); } catch {} }
     }
+  }
+});
+
+/* ---------- Two-way Relay via DMs ---------- */
+client.on(Events.MessageCreate, async (msg) => {
+  try {
+    // Ignore bot messages
+    if (msg.author.bot) return;
+
+    // 1) ADMIN → USER (admin replies to the bot's prior DM embed)
+    // DM channel with admin?
+    const isDm = msg.channel?.type === ChannelType.DM;
+    if (isDm && msg.author.id === String(ADMIN_USER_ID).replace(/\D/g, '')) {
+      // We only act when admin REPLIES to a specific bot message that contained UID
+      const refId = msg.reference?.messageId;
+      if (!refId) return; // require using the reply feature for disambiguation
+
+      let referenced;
+      try { referenced = await msg.channel.messages.fetch(refId); } catch {}
+      if (!referenced) return;
+
+      const targetUserId = getUidFromEmbedFooter(referenced);
+      if (!targetUserId) return;
+
+      // Forward to the user
+      let targetUser;
+      try { targetUser = await client.users.fetch(targetUserId, { force: true }); } catch {}
+      if (!targetUser) {
+        await msg.channel.send(`⚠️ Could not find user ID ${targetUserId}. They may have left or blocked DMs.`);
+        return;
+      }
+
+      const userDm = await targetUser.createDM();
+      const attachmentUrls = [...msg.attachments.values()].map(a => ({ url: a.url }));
+      await userDm.send({
+        content: `✉️ You received a reply from the Admin.`,
+        embeds: [
+          buildUserFromAdminEmbed({
+            adminUser: msg.author,
+            message: msg.content?.trim(),
+            attachments: attachmentUrls
+          })
+        ]
+      });
+
+      return;
+    }
+
+    // 2) USER → ADMIN (user DMs the bot later with follow-ups)
+    if (isDm) {
+      // If it's a user (not admin), relay to admin
+      if (msg.author.id !== String(ADMIN_USER_ID).replace(/\D/g, '')) {
+        const adminUser = await client.users.fetch(String(ADMIN_USER_ID).replace(/\D/g, ''), { force: true }).catch(() => null);
+        if (!adminUser) return;
+
+        const dm = await adminUser.createDM();
+
+        // First, a small context line (once per conversation is fine)
+        // Then the embed including UID for reply routing
+        const attachmentUrls = [...msg.attachments.values()].map(a => ({ url: a.url }));
+
+        // If we already have a "prompt anchor" message for this user, we can thread replies by telling admin to reply to any of those
+        const anchorMsgId = lastAdminPromptMsgIdByUser.get(msg.author.id);
+        if (!anchorMsgId) {
+          // New conversation anchor for this user
+          const intro = await dm.send(`📨 New message from **${msg.author.tag}** (via DM).`);
+          const anchor = await dm.send({
+            embeds: [
+              buildAdminInboxEmbed({
+                user: msg.author,
+                guildName: 'Direct Message',
+                message: msg.content?.trim(),
+                attachments: attachmentUrls
+              })
+            ]
+          });
+          lastAdminPromptMsgIdByUser.set(msg.author.id, anchor.id);
+        } else {
+          // We still send a new embed so admin can reply specifically to this new item if they wish
+          await dm.send({
+            embeds: [
+              buildAdminInboxEmbed({
+                user: msg.author,
+                guildName: 'Direct Message',
+                message: msg.content?.trim(),
+                attachments: attachmentUrls
+              })
+            ]
+          });
+        }
+      }
+    }
+  } catch (e) {
+    console.error('DM Relay Error:', e);
   }
 });
 
